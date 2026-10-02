@@ -1,0 +1,6 @@
+import { NextResponse } from 'next/server';
+import { z } from 'zod';
+import { analyzeMatch } from '@/lib/ai';
+import { supabase } from '@/lib/supabase';
+const input=z.object({sheet:z.unknown(),profile:z.object({weights:z.object({tech:z.number().int().min(0).max(100),experience:z.number().int().min(0).max(100),career:z.number().int().min(0).max(100)}),career_goals:z.string().optional(),avoid_work:z.string().optional(),desired_rate:z.number().nullable().optional(),desired_work_style:z.string().optional()}),project:z.unknown()});
+export async function POST(req:Request){try{const db=await supabase();const {data:{user}}=await db.auth.getUser();if(!user)return NextResponse.json({error:'ログインしてください'}, {status:401});if(!process.env.ANTHROPIC_API_KEY||!process.env.ANTHROPIC_MODEL) return NextResponse.json({error:'AI設定がありません'}, {status:503});const data=input.parse(await req.json());if(data.profile.weights.tech+data.profile.weights.experience+data.profile.weights.career!==100)return NextResponse.json({error:'スコアの重みの合計を100%にしてください'}, {status:400});return NextResponse.json(await analyzeMatch(data));}catch(e){if(e instanceof z.ZodError)return NextResponse.json({error:'入力形式を確認してください'}, {status:400});return NextResponse.json({error:e instanceof Error?e.message:'分析に失敗しました'}, {status:502});}}
