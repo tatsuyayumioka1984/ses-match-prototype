@@ -1,8 +1,12 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
-import { supabase } from '@/lib/supabase';
+import { workspaceContext } from '@/lib/workspace-context';
 
 const score = z.number().int().min(0).max(100);
+
+function latestMatchResults(items: any[] | null) {
+  return [...(items || [])].sort((a, b) => Date.parse(b.created_at || '') - Date.parse(a.created_at || '')).slice(0, 1);
+}
 const schema = z.object({
   title: z.string().min(1),
   source_text: z.string().default(''),
@@ -22,34 +26,35 @@ const schema = z.object({
 });
 
 export async function GET(req: Request) {
-  const db = await supabase();
-  const { data: { user } } = await db.auth.getUser();
+  const { db, user, workspace } = await workspaceContext();
   if (!user) return NextResponse.json({ error: 'ログインしてください' }, { status: 401 });
+  if (!workspace) return NextResponse.json({ error: 'ワークスペースがありません' }, { status: 404 });
 
   const projectId = new URL(req.url).searchParams.get('id');
   if (projectId) {
     const parsedId = z.string().uuid().safeParse(projectId);
     if (!parsedId.success) return NextResponse.json({ error: '案件を確認してください' }, { status: 400 });
     const { data, error } = await db.from('projects')
-      .select('id,title,source_text,requirements,created_at,status,rate,location,work_style,sales_contact,match_results(total_score)')
-      .eq('id', parsedId.data).eq('user_id', user.id).maybeSingle();
+      .select('id,title,source_text,requirements,created_at,status,rate,location,work_style,sales_contact,match_results(total_score,tech_score,experience_score,career_score,detail,created_at)')
+      .eq('id', parsedId.data).eq('workspace_id', workspace.id).maybeSingle();
     if (error) return NextResponse.json({ error: '案件を取得できませんでした' }, { status: 500 });
     if (!data) return NextResponse.json({ error: '案件が見つかりません' }, { status: 404 });
-    return NextResponse.json(data);
+    return NextResponse.json({ ...data, match_results: latestMatchResults(data.match_results) });
   }
 
   const { data, error } = await db
     .from('projects')
     .select('id,title,created_at,status,rate,match_results(total_score)')
+    .eq('workspace_id', workspace.id)
     .order('created_at', { ascending: false });
   if (error) return NextResponse.json({ error: '案件を取得できませんでした' }, { status: 500 });
-  return NextResponse.json(data);
+  return NextResponse.json((data || []).map((project: any) => ({ ...project, match_results: latestMatchResults(project.match_results) })));
 }
 
 export async function POST(req: Request) {
-  const db = await supabase();
-  const { data: { user } } = await db.auth.getUser();
+  const { db, user, workspace } = await workspaceContext();
   if (!user) return NextResponse.json({ error: 'ログインしてください' }, { status: 401 });
+  if (!workspace) return NextResponse.json({ error: 'ワークスペースがありません' }, { status: 404 });
 
   let body: unknown;
   try {
@@ -63,7 +68,7 @@ export async function POST(req: Request) {
   const { analysis, ...projectFields } = parsed.data;
   const { data: project, error } = await db
     .from('projects')
-    .insert({ ...projectFields, user_id: user.id })
+    .insert({ ...projectFields, user_id: user.id, workspace_id: workspace.id })
     .select()
     .single();
   if (error) return NextResponse.json({ error: '案件を保存できませんでした' }, { status: 500 });
@@ -79,7 +84,7 @@ export async function POST(req: Request) {
       detail: analysis.detail,
     });
     if (matchError) {
-      await db.from('projects').delete().eq('id', project.id).eq('user_id', user.id);
+      await db.from('projects').delete().eq('id', project.id).eq('workspace_id', workspace.id);
       return NextResponse.json({ error: '案件は保存できましたが、分析結果を保存できませんでした。もう一度お試しください' }, { status: 500 });
     }
   }
@@ -89,9 +94,9 @@ export async function POST(req: Request) {
 const projectStatus = z.enum(['proposed', 'interview_scheduled', 'interview_completed', 'offer', 'rejected']);
 
 export async function DELETE(req: Request) {
-  const db = await supabase();
-  const { data: { user } } = await db.auth.getUser();
+  const { db, user, workspace } = await workspaceContext();
   if (!user) return NextResponse.json({ error: 'ログインしてください' }, { status: 401 });
+  if (!workspace) return NextResponse.json({ error: 'ワークスペースがありません' }, { status: 404 });
 
   let body: unknown;
   try {
@@ -102,11 +107,16 @@ export async function DELETE(req: Request) {
   const parsed = z.object({ id: z.string().uuid() }).safeParse(body);
   if (!parsed.success) return NextResponse.json({ error: '削除する案件を確認してください' }, { status: 400 });
 
+  const { data: target, error: targetError } = await db.from('projects').select('id,user_id')
+    .eq('id', parsed.data.id).eq('workspace_id', workspace.id).maybeSingle();
+  if (targetError) return NextResponse.json({ error: '案件を確認できませんでした' }, { status: 500 });
+  if (!target) return NextResponse.json({ error: '案件が見つかりません' }, { status: 404 });
+  if (target.user_id !== user.id && workspace.role !== 'admin') return NextResponse.json({ error: '作成者または管理者のみ案件を削除できます' }, { status: 403 });
   const { data, error } = await db
     .from('projects')
     .delete()
     .eq('id', parsed.data.id)
-    .eq('user_id', user.id)
+    .eq('workspace_id', workspace.id)
     .select('id')
     .maybeSingle();
   if (error) return NextResponse.json({ error: '案件を削除できませんでした' }, { status: 500 });
@@ -115,9 +125,9 @@ export async function DELETE(req: Request) {
 }
 
 export async function PATCH(req: Request) {
-  const db = await supabase();
-  const { data: { user } } = await db.auth.getUser();
+  const { db, user, workspace } = await workspaceContext();
   if (!user) return NextResponse.json({ error: 'ログインしてください' }, { status: 401 });
+  if (!workspace) return NextResponse.json({ error: 'ワークスペースがありません' }, { status: 404 });
 
   let body: unknown;
   try {
@@ -137,13 +147,13 @@ export async function PATCH(req: Request) {
       .from('projects')
       .update({ status: parsed.data.status })
       .eq('id', parsed.data.id)
-      .eq('user_id', user.id);
+      .eq('workspace_id', workspace.id);
     if (error) return NextResponse.json({ error: 'ステータスを保存できませんでした' }, { status: 500 });
   }
 
   if (parsed.data.analysis) {
     const { data: ownedProject, error: ownerError } = await db.from('projects').select('id')
-      .eq('id', parsed.data.id).eq('user_id', user.id).maybeSingle();
+      .eq('id', parsed.data.id).eq('workspace_id', workspace.id).maybeSingle();
     if (ownerError) return NextResponse.json({ error: '案件を確認できませんでした' }, { status: 500 });
     if (!ownedProject) return NextResponse.json({ error: '案件が見つかりません' }, { status: 404 });
     const { data: existing, error: existingError } = await db.from('match_results').select('id')
@@ -151,8 +161,6 @@ export async function PATCH(req: Request) {
       .order('created_at', { ascending: false }).limit(1).maybeSingle();
     if (existingError) return NextResponse.json({ error: '既存の分析結果を確認できませんでした' }, { status: 500 });
     const values = {
-      project_id: parsed.data.id,
-      user_id: user.id,
       total_score: parsed.data.analysis.total_score,
       tech_score: parsed.data.analysis.tech_score,
       experience_score: parsed.data.analysis.experience_score,
@@ -161,13 +169,13 @@ export async function PATCH(req: Request) {
     };
     const { error } = existing
       ? await db.from('match_results').update(values).eq('id', existing.id).eq('user_id', user.id)
-      : await db.from('match_results').insert(values);
+      : await db.from('match_results').insert({ ...values, project_id: parsed.data.id, user_id: user.id });
     if (error) return NextResponse.json({ error: '分析結果を保存できませんでした' }, { status: 500 });
   }
 
   const { data, error } = await db.from('projects')
     .select('id,title,created_at,status,rate,match_results(total_score)')
-    .eq('id', parsed.data.id).eq('user_id', user.id).single();
+    .eq('id', parsed.data.id).eq('workspace_id', workspace.id).single();
   if (error) return NextResponse.json({ error: '案件を取得できませんでした' }, { status: 500 });
   return NextResponse.json(data);
 }
